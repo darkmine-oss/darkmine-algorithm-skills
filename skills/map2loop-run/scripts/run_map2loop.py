@@ -250,6 +250,55 @@ def _dump_intermediates(proj, out_dir: pathlib.Path):
 
 # ---------- Stage 6: LoopStructural ----------
 
+def _iter_stratigraphic_surfaces(model):
+    """Yield (name, pyvista mesh) for each well-extractable stratigraphic horizon.
+
+    Bypasses LoopStructural 1.6.27's `GeologicalModel.get_stratigraphic_surfaces()`
+    which uses `stratigraphic_column.get_isovalues()` — that method is broken
+    here and returns `value=inf` for every unit except the first, so only one
+    horizon survives. Instead we pull each unit's `min` value out of the
+    processor's stratigraphic_column (which carries the cumulative-thickness
+    isovalues correctly) and call `feature.surfaces()` directly per supergroup.
+
+    Boundary units with `min=-inf` or `max=+inf` are skipped (their isovalues
+    are open-ended sentinels, not real surfaces).
+    """
+    processor = getattr(model, "_wrapper_processor", None)
+    if processor is None or not getattr(processor, "stratigraphic_column", None):
+        # Fall back to LoopStructural's own iterator (may produce 1 surface).
+        for s in model.get_stratigraphic_surfaces():
+            mesh = s.vtk() if hasattr(s, "vtk") else None
+            if mesh is not None and mesh.n_points > 0:
+                yield (getattr(s, "name", None) or "unit"), mesh
+        return
+    import math
+    for group, units in processor.stratigraphic_column.items():
+        if group == "faults":
+            continue
+        feature = model.get_feature_by_name(group)
+        if feature is None:
+            continue
+        values, names = [], []
+        for unit_name, info in units.items():
+            v = info.get("min")
+            if v is None or not math.isfinite(v):
+                continue
+            values.append(float(v))
+            names.append(unit_name)
+        if not values:
+            continue
+        try:
+            surfaces = feature.surfaces(values, model.bounding_box, name=names)
+        except Exception as exc:
+            print(f"  ! feature.surfaces({group}) failed: {exc}")
+            continue
+        for s in surfaces:
+            mesh = s.vtk() if hasattr(s, "vtk") else None
+            if mesh is not None and mesh.n_points > 0:
+                yield getattr(s, "name", "unit"), mesh
+
+
+
 def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats):
     """Load the .loop3d, build implicit surfaces, dump VTK + HTML."""
     try:
@@ -260,31 +309,24 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
         print(f"  ! LoopStructural import failed ({exc}); skipping --build-3d")
         return {}
     pf = ProjectFile(str(loop_filename))
-    # use_thickness=True was tried; on the bundled Hamersley dataset it
-    # over-constrains the foliation interpolator so badly that the entire
-    # scalar field becomes inf and zero isosurfaces extract — worse than
-    # the default. Surface quality is a LoopStructural tuning problem
-    # (regularisation, nelements, per-unit thicknesses) that lives
-    # beyond this wrapper's scope; better to leave the default config and
-    # let users open the .loop3d in their own LoopStructural notebook.
     processor = LoopProjectfileProcessor(pf)
     model = GeologicalModel.from_processor(processor)
     model.update()
+    # Cache the processor on the model so _get_stratigraphic_surfaces can read
+    # the correct per-unit isovalues out of it. LoopStructural's
+    # stratigraphic_column.get_isovalues() returns value=inf for every unit
+    # except the first in this version (1.6.27) — that's why the default
+    # model.get_stratigraphic_surfaces() produces only 1/N surfaces and 10x
+    # "Failed to extract isosurface for inf" warnings. We pull the isovalues
+    # straight from the processor's stratigraphic_column instead.
+    model._wrapper_processor = processor
     exported = {}
     if "vtk" in export_formats:
         try:
             import pyvista as pv
-            # Save the actual stratigraphic + fault surfaces as a MultiBlock
-            # VTK — far more useful for ParaView than a coarse scalar field
-            # on the bounding-box grid (which collapses to a single unit when
-            # any isosurface fails). Each block carries its feature name.
             blocks = pv.MultiBlock()
-            try:
-                for s in model.get_stratigraphic_surfaces():
-                    name = getattr(s, "name", None) or "unit"
-                    blocks[name] = s.vtk()
-            except Exception as exc:
-                print(f"  ! stratigraphic surfaces export skipped: {exc}")
+            for name, mesh in _iter_stratigraphic_surfaces(model):
+                blocks[name] = mesh
             try:
                 for f in model.get_fault_surfaces():
                     name = getattr(f, "name", None) or "fault"
@@ -308,16 +350,11 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
             strati_count = fault_count = 0
             colors = ["#1932e2", "#628304", "#5fb3c5", "#5d7e60", "#f48b70",
                       "#a2f290", "#e7f2f3", "#0c2562", "#d0d47c", "#387866", "#106e8a"]
-            try:
-                for i, s in enumerate(model.get_stratigraphic_surfaces()):
-                    mesh = s.vtk()
-                    if mesh is not None and mesh.n_points > 0:
-                        plotter.add_mesh(mesh, color=colors[i % len(colors)],
-                                         name=getattr(s, "name", None),
-                                         show_scalar_bar=False, opacity=0.85)
-                        strati_count += 1
-            except Exception as exc:
-                print(f"  ! stratigraphic surfaces export skipped: {exc}")
+            for i, (name, mesh) in enumerate(_iter_stratigraphic_surfaces(model)):
+                plotter.add_mesh(mesh, color=colors[i % len(colors)],
+                                 name=name,
+                                 show_scalar_bar=False, opacity=0.85)
+                strati_count += 1
             try:
                 for f in model.get_fault_surfaces():
                     mesh = f.vtk()
