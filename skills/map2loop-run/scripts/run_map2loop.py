@@ -289,21 +289,69 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
         except Exception as exc:
             print(f"  ! VTK export failed: {exc}")
             exported["model.vtm"] = False
-    if "html" in export_formats:
+    if "html" in export_formats or "png" in export_formats:
         try:
-            from loopstructuralvisualisation import Loop3DView
-            view = Loop3DView(model, off_screen=True)
-            # cmap is passed explicitly to bypass a known integration drift
-            # between LoopStructural's StratigraphicColumn object and
-            # loopstructuralvisualisation._build_stratigraphic_cmap, which
-            # assumes the column is a dict-of-dicts.
-            view.plot_model_surfaces(cmap="tab20")
-            view.export_html(str(out_dir / "model.html"))
-            exported["model.html"] = True
+            import pyvista as pv
+            # Build a fresh plotter from the surfaces we just collected.
+            # pyvista's export_html (via trame) bakes the geometry as base64
+            # but the resulting page won't load over file:// in most browsers
+            # because it uses <script type="module"> — so we always also
+            # write a PNG screenshot (works everywhere, no server needed).
+            plotter = pv.Plotter(off_screen=True, window_size=(1600, 1200))
+            strati_count = fault_count = 0
+            colors = ["#1932e2", "#628304", "#5fb3c5", "#5d7e60", "#f48b70",
+                      "#a2f290", "#e7f2f3", "#0c2562", "#d0d47c", "#387866", "#106e8a"]
+            try:
+                for i, s in enumerate(model.get_stratigraphic_surfaces()):
+                    mesh = s.vtk()
+                    if mesh is not None and mesh.n_points > 0:
+                        plotter.add_mesh(mesh, color=colors[i % len(colors)],
+                                         name=getattr(s, "name", None),
+                                         show_scalar_bar=False, opacity=0.85)
+                        strati_count += 1
+            except Exception as exc:
+                print(f"  ! stratigraphic surfaces export skipped: {exc}")
+            try:
+                for f in model.get_fault_surfaces():
+                    mesh = f.vtk()
+                    if mesh is not None and mesh.n_points > 0:
+                        plotter.add_mesh(mesh, color="black",
+                                         name=getattr(f, "name", None),
+                                         show_scalar_bar=False, opacity=0.4)
+                        fault_count += 1
+            except Exception as exc:
+                print(f"  ! fault surfaces export skipped: {exc}")
+            plotter.show_axes()
+            plotter.camera.azimuth = 30
+            plotter.camera.elevation = -25
+            print(f"               (3D scene: {strati_count} stratigraphic + {fault_count} fault surfaces)")
+            if "png" in export_formats:
+                plotter.screenshot(str(out_dir / "model.png"))
+                exported["model.png"] = True
+            if "html" in export_formats:
+                plotter.export_html(str(out_dir / "model.html"))
+                # Trame's exported HTML uses ES modules and won't load from
+                # file:// in Safari/Chrome. Drop a sibling helper script.
+                _write_html_helper(out_dir)
+                exported["model.html"] = True
+            plotter.close()
         except Exception as exc:
-            print(f"  ! HTML export failed: {exc}")
-            exported["model.html"] = False
+            print(f"  ! 3D export failed: {exc}")
     return exported
+
+
+def _write_html_helper(out_dir: pathlib.Path):
+    """Write a one-liner shell script that serves model.html over HTTP."""
+    helper = out_dir / "serve_model_html.sh"
+    helper.write_text(
+        "#!/usr/bin/env bash\n"
+        "# model.html uses ES modules and won't load from file:// — serve it.\n"
+        'cd "$(dirname "$0")" || exit 1\n'
+        "PORT=${1:-8765}\n"
+        'echo "Open http://localhost:${PORT}/model.html in your browser"\n'
+        'python3 -m http.server "$PORT"\n'
+    )
+    helper.chmod(0o755)
 
 
 # ---------- main ----------
@@ -339,8 +387,12 @@ def main(argv=None):
                    help="Build 3D surfaces via LoopStructural after map2loop runs.")
     g.add_argument("--no-build-3d", action="store_true",
                    help="Skip the LoopStructural step (default for wfs/local).")
-    p.add_argument("--export", default="vtk,html",
-                   help="Comma-separated 3D export formats (default: vtk,html).")
+    p.add_argument("--export", default="vtk,html,png",
+                   help="Comma-separated 3D export formats: any of vtk, html, png "
+                        "(default: vtk,html,png). 'vtk' writes a MultiBlock .vtm "
+                        "for ParaView; 'png' is the always-viewable screenshot; "
+                        "'html' is interactive but needs HTTP serving — see the "
+                        "serve_model_html.sh helper that's written alongside.")
     p.add_argument("--loop-filename", default="output.loop3d",
                    help="Filename for the .loop3d output (default: output.loop3d).")
     p.add_argument("--quiet", action="store_true",
