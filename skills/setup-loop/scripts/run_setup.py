@@ -55,6 +55,12 @@ def _create_env(conda, env_name, map2loop_spec, loopstructural_spec):
         loopstructural_spec,
         "loopstructuralvisualisation",
         "pyvista",
+        # trame + trame-vtk are required by Loop3DView.export_html() — without
+        # them HTML export of the 3D scene silently fails.
+        "trame",
+        "trame-vtk",
+        "trame-vuetify",
+        "pip",
     ]
     channels = ["-c", "loop3d", "-c", "conda-forge"]
     if _env_exists(conda, env_name):
@@ -63,6 +69,23 @@ def _create_env(conda, env_name, map2loop_spec, loopstructural_spec):
     else:
         print(f"[env] creating conda env {env_name}")
         _run([conda, "create", "-n", env_name, "-y", *channels, "python=3.12", *extra_specs])
+    # nest_asyncio2 is pip-only — required for pyvista to launch the trame
+    # server synchronously when called from a normal Python script (vs Jupyter).
+    print("[env] pip install nest_asyncio2 (required for Loop3DView.export_html outside Jupyter)")
+    env_python = _env_python_path(conda, env_name)
+    _run([str(env_python), "-m", "pip", "install", "--quiet", "nest_asyncio2"])
+
+
+def _env_python_path(conda, env_name):
+    """Locate the python executable for the named conda env."""
+    import json
+    out = subprocess.run(
+        [conda, "env", "list", "--json"], capture_output=True, text=True, check=True,
+    )
+    for path in json.loads(out.stdout).get("envs", []):
+        if Path(path).name == env_name:
+            return Path(path) / "bin" / "python"
+    raise SystemExit(f"Could not locate python for env {env_name!r}")
 
 
 def _resolve_link_root(scope, project_dir):

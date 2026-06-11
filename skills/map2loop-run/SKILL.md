@@ -95,8 +95,10 @@ The `--config-json` file must map your shapefile columns to map2loop's expected 
 | `output.loop3d` | `Project.save_into_projectfile()` | the headline artifact |
 | `stratigraphy.csv` | `proj.stratigraphic_column.stratigraphicUnits` | Stage 5 |
 | `contacts.csv` | `proj.map_data.sampled_contacts` | Stage 2 |
-| `orientations.csv` | `proj.map_data.sampled_structures` | Stage 3 |
-| `topology.gml` | `proj.topology.geology_network` | Stage 4 |
+| `orientations.csv` | `proj.map_data.STRUCTURE` | Stage 3 |
+| `topology_unit_unit.csv` | `proj.topology.unit_unit_relationships` | Stage 4 |
+| `topology_unit_fault.csv` | `proj.topology.unit_fault_relationships` | Stage 4 |
+| `topology_fault_fault.csv` | `proj.topology.fault_fault_relationships` | Stage 4 |
 | `model.vtk` | LoopStructural `model.evaluate_model` on a structured grid | Stage 6 (opt) |
 | `model.html` | `Loop3DView` interactive scene | Stage 6 (opt) |
 | `run_summary.json` | inputs + library versions + git rev + timing | provenance |

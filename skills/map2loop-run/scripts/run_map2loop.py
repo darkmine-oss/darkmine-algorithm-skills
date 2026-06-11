@@ -44,30 +44,50 @@ HAMERSLEY_CONFIG = {
 
 # ---------- sorter registry ----------
 
-def _build_sorter(name: str):
-    """Return a map2loop Sorter instance for the given short name."""
+def _build_sorter(name: str, proj):
+    """Return a map2loop Sorter instance, or None for ``take_best``.
+
+    Some sorters (SorterAlpha, SorterMaximiseContacts, SorterObservationProjections)
+    require data that doesn't exist until after Project.run_all begins. For
+    ``take_best`` we skip set_sorter entirely — ``run_all(take_best=True)``
+    constructs its own sorter list internally. For the others we instantiate
+    with no args and let map2loop's deferred-attribute mechanism populate the
+    rest once contacts/relationships are ready.
+    """
+    if name == "take_best":
+        return None
     from map2loop.sorter import (
-        SorterAlpha,
         SorterAgeBased,
         SorterUseHint,
         SorterUseNetworkX,
         SorterMaximiseContacts,
         SorterObservationProjections,
     )
-    mapping = {
-        "alpha":      SorterAlpha,
+    no_arg_mapping = {
         "age":        SorterAgeBased,
         "hint":       SorterUseHint,
         "networkx":   SorterUseNetworkX,
         "maximise":   SorterMaximiseContacts,
         "projection": SorterObservationProjections,
-        "take_best":  SorterAlpha,    # placeholder — see _run_pipeline
     }
-    if name not in mapping:
-        raise SystemExit(
-            f"Unknown sorter {name!r}. Valid: {', '.join(sorted(mapping))}."
+    if name == "alpha":
+        # SorterAlpha needs contacts at construct time, which don't exist until
+        # run_all extracts them. Pre-run the contact extractor to satisfy it.
+        from map2loop.sorter import SorterAlpha
+        from map2loop.contact_extractor import ContactExtractor
+        from map2loop.m2l_enums import Datatype
+        proj.contact_extractor = ContactExtractor(
+            proj.map_data.get_map_data(Datatype.GEOLOGY),
+            proj.map_data.get_map_data(Datatype.FAULT),
         )
-    return mapping[name]()
+        proj.contact_extractor.extract_all_contacts()
+        return SorterAlpha(contacts=proj.contact_extractor.contacts)
+    if name in no_arg_mapping:
+        return no_arg_mapping[name]()
+    raise SystemExit(
+        f"Unknown sorter {name!r}. Valid: alpha, age, hint, networkx, "
+        "maximise, projection, take_best."
+    )
 
 
 # ---------- I/O helpers ----------
@@ -179,7 +199,9 @@ def _run_pipeline(proj, sorter_name, spacing):
     proj.set_sampler(Datatype.GEOLOGY, SamplerSpacing(spacing))
     proj.set_sampler(Datatype.FAULT, SamplerSpacing(spacing))
     take_best = sorter_name == "take_best"
-    proj.set_sorter(_build_sorter(sorter_name))
+    sorter = _build_sorter(sorter_name, proj)
+    if sorter is not None:
+        proj.set_sorter(sorter)
     t0 = time.monotonic()
     proj.run_all(take_best=take_best)
     return time.monotonic() - t0
@@ -208,18 +230,21 @@ def _dump_intermediates(proj, out_dir: pathlib.Path):
     md = getattr(proj, "map_data", None)
     if md is not None:
         dumps["contacts.csv"] = _to_csv(getattr(md, "sampled_contacts", None), out_dir / "contacts.csv")
-        dumps["orientations.csv"] = _to_csv(getattr(md, "sampled_structures", None), out_dir / "orientations.csv")
+        # Orientations: map_data.STRUCTURE is the raw GeoDataFrame of bedding
+        # measurements (X, Y, dip, dipdir, ...). map2loop doesn't "sample"
+        # structures because they're already point data.
+        dumps["orientations.csv"] = _to_csv(getattr(md, "STRUCTURE", None), out_dir / "orientations.csv")
     topo = getattr(proj, "topology", None)
     if topo is not None:
-        try:
-            import networkx as nx
-            graph = getattr(topo, "geology_network", None) or getattr(topo, "graph", None)
-            if graph is not None:
-                nx.write_gml(graph, str(out_dir / "topology.gml"))
-                dumps["topology.gml"] = True
-        except Exception as exc:
-            print(f"  ! could not write topology.gml: {exc}")
-            dumps["topology.gml"] = False
+        # map2loop stores topology as three pandas DataFrames (not a graph).
+        # Dump each as CSV — they're directly visualisable in Excel/QGIS and
+        # can be loaded into NetworkX or yEd by the user if a graph is wanted.
+        for attr, fname in (
+            ("unit_unit_relationships",   "topology_unit_unit.csv"),
+            ("unit_fault_relationships",  "topology_unit_fault.csv"),
+            ("fault_fault_relationships", "topology_fault_fault.csv"),
+        ):
+            dumps[fname] = _to_csv(getattr(topo, attr, None), out_dir / fname)
     return dumps
 
 
@@ -254,7 +279,11 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
         try:
             from loopstructuralvisualisation import Loop3DView
             view = Loop3DView(model, off_screen=True)
-            view.plot_model_surfaces()
+            # cmap is passed explicitly to bypass a known integration drift
+            # between LoopStructural's StratigraphicColumn object and
+            # loopstructuralvisualisation._build_stratigraphic_cmap, which
+            # assumes the column is a dict-of-dicts.
+            view.plot_model_surfaces(cmap="tab20")
             view.export_html(str(out_dir / "model.html"))
             exported["model.html"] = True
         except Exception as exc:
