@@ -266,15 +266,29 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
     exported = {}
     if "vtk" in export_formats:
         try:
-            import pyvista as pv  # noqa: F401
-            grid = model.bounding_box.vtk()
-            scalar_field = model.evaluate_model(grid.points, scale=False)
-            grid["stratigraphy"] = scalar_field
-            grid.save(str(out_dir / "model.vtk"))
-            exported["model.vtk"] = True
+            import pyvista as pv
+            # Save the actual stratigraphic + fault surfaces as a MultiBlock
+            # VTK — far more useful for ParaView than a coarse scalar field
+            # on the bounding-box grid (which collapses to a single unit when
+            # any isosurface fails). Each block carries its feature name.
+            blocks = pv.MultiBlock()
+            try:
+                for s in model.get_stratigraphic_surfaces():
+                    name = getattr(s, "name", None) or "unit"
+                    blocks[name] = s.vtk()
+            except Exception as exc:
+                print(f"  ! stratigraphic surfaces export skipped: {exc}")
+            try:
+                for f in model.get_fault_surfaces():
+                    name = getattr(f, "name", None) or "fault"
+                    blocks[name] = f.vtk()
+            except Exception as exc:
+                print(f"  ! fault surfaces export skipped: {exc}")
+            blocks.save(str(out_dir / "model.vtm"))
+            exported["model.vtm"] = True
         except Exception as exc:
             print(f"  ! VTK export failed: {exc}")
-            exported["model.vtk"] = False
+            exported["model.vtm"] = False
     if "html" in export_formats:
         try:
             from loopstructuralvisualisation import Loop3DView

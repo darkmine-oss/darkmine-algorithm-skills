@@ -99,7 +99,7 @@ The `--config-json` file must map your shapefile columns to map2loop's expected 
 | `topology_unit_unit.csv` | `proj.topology.unit_unit_relationships` | Stage 4 |
 | `topology_unit_fault.csv` | `proj.topology.unit_fault_relationships` | Stage 4 |
 | `topology_fault_fault.csv` | `proj.topology.fault_fault_relationships` | Stage 4 |
-| `model.vtk` | LoopStructural `model.evaluate_model` on a structured grid | Stage 6 (opt) |
+| `model.vtm` | LoopStructural stratigraphic + fault surfaces as a pyvista MultiBlock | Stage 6 (opt) |
 | `model.html` | `Loop3DView` interactive scene | Stage 6 (opt) |
 | `run_summary.json` | inputs + library versions + git rev + timing | provenance |
 

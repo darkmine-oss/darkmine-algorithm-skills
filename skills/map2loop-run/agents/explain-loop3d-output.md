@@ -16,7 +16,7 @@ Given the path to an `OUT_DIR`:
    - `contacts.csv` — sampled basal contacts (Stage 2). One row per point with X/Y/Z and the unit it belongs to.
    - `orientations.csv` — raw structural orientations (Stage 3). Used by Stage 6 to interpolate the foliation field.
    - `topology_unit_unit.csv` / `topology_unit_fault.csv` / `topology_fault_fault.csv` — Stage 4 adjacency tables. Load into NetworkX / yEd / Gephi if a graph view is wanted.
-   - `model.vtk` — Stage 6 implicit surface field, sampled on a rectilinear grid. Open in ParaView.
+   - `model.vtm` — Stage 6 stratigraphic + fault surfaces packed as a pyvista MultiBlock. Open in ParaView (the `.vtm` is an XML index that references per-surface `.vtp` files in a sibling directory).
    - `model.html` — Stage 6 interactive 3D scene. Open in any browser.
 3. If any expected file is missing, explain why (look at `intermediates` and `exports` in the summary for diagnostic flags) and what to do about it.
 4. Suggest next steps:
