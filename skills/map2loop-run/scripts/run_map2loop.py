@@ -329,9 +329,9 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
                 plotter.screenshot(str(out_dir / "model.png"))
                 exported["model.png"] = True
             if "html" in export_formats:
-                plotter.export_html(str(out_dir / "model.html"))
-                # Trame's exported HTML uses ES modules and won't load from
-                # file:// in Safari/Chrome. Drop a sibling helper script.
+                html_path = out_dir / "model.html"
+                plotter.export_html(str(html_path))
+                _patch_html_load_order(html_path)
                 _write_html_helper(out_dir)
                 exported["model.html"] = True
             plotter.close()
@@ -340,12 +340,37 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
     return exported
 
 
+def _patch_html_load_order(html_path: pathlib.Path):
+    """Defer the OfflineLocalView.load call until the ES module is ready.
+
+    pyvista / trame_vtk write an inline non-module <script> at the end of
+    the HTML that calls OfflineLocalView.load(...) directly. That script
+    runs synchronously during HTML parsing, before the <script type=\"module\">
+    above has evaluated and exposed OfflineLocalView — so the call hits
+    'OfflineLocalView is not defined' and the viewer renders blank.
+    Wrap the call in a poll loop that waits for the symbol to appear.
+    """
+    text = html_path.read_text()
+    needle = "OfflineLocalView.load(container, { base64Str });"
+    if needle not in text:
+        return
+    fixed = (
+        "(function waitForVTK(){\n"
+        "  if (typeof OfflineLocalView !== 'undefined') {\n"
+        "    OfflineLocalView.load(container, { base64Str });\n"
+        "  } else { setTimeout(waitForVTK, 50); }\n"
+        "})();"
+    )
+    html_path.write_text(text.replace(needle, fixed))
+
+
 def _write_html_helper(out_dir: pathlib.Path):
     """Write a one-liner shell script that serves model.html over HTTP."""
     helper = out_dir / "serve_model_html.sh"
     helper.write_text(
         "#!/usr/bin/env bash\n"
-        "# model.html uses ES modules and won't load from file:// — serve it.\n"
+        "# model.html uses ES modules; some browsers block them over file://.\n"
+        "# This helper serves the dir over HTTP so the viewer always loads.\n"
         'cd "$(dirname "$0")" || exit 1\n'
         "PORT=${1:-8765}\n"
         'echo "Open http://localhost:${PORT}/model.html in your browser"\n'
