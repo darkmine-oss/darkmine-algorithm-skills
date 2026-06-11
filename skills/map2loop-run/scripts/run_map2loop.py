@@ -260,6 +260,13 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
         print(f"  ! LoopStructural import failed ({exc}); skipping --build-3d")
         return {}
     pf = ProjectFile(str(loop_filename))
+    # use_thickness=True was tried; on the bundled Hamersley dataset it
+    # over-constrains the foliation interpolator so badly that the entire
+    # scalar field becomes inf and zero isosurfaces extract — worse than
+    # the default. Surface quality is a LoopStructural tuning problem
+    # (regularisation, nelements, per-unit thicknesses) that lives
+    # beyond this wrapper's scope; better to leave the default config and
+    # let users open the .loop3d in their own LoopStructural notebook.
     processor = LoopProjectfileProcessor(pf)
     model = GeologicalModel.from_processor(processor)
     model.update()
