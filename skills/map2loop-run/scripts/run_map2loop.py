@@ -146,7 +146,47 @@ def _safe_versions():
 
 # ---------- Stage 1-5: run map2loop ----------
 
+def _patch_map2loop_v3_3_1_bugs():
+    """Monkey-patch map2loop 3.3.1 bugs that block WFS / local-data paths.
+
+    1. mapdata.MapData.parse_fault_map line 1123 does ``fault["NAME"].lower()``
+       which throws AttributeError when NAME is a float NaN. The bundled
+       Hamersley demo has every fault NAMEd, so this never fires there, but
+       Loop3D's WFS-fed WAROX fault data leaves many faults unnamed.
+       Pre-coerce NaN names to the literal string ``"nan"`` before the
+       original method runs; the original then replaces ``"nan"`` with a
+       generated ``Fault_<ID>``.
+    """
+    import map2loop.mapdata as mapdata_mod
+    import pandas as pd
+    if getattr(mapdata_mod.MapData.parse_fault_map, "_dms_patched", False):
+        return
+    original = mapdata_mod.MapData.parse_fault_map
+
+    def patched(self):
+        # raw_data is a list indexed by Datatype enum (IntEnum). Guard for
+        # both shape and presence — some load paths leave the slot None.
+        try:
+            raw = self.raw_data[int(mapdata_mod.Datatype.FAULT)]
+        except Exception:
+            raw = None
+        if raw is not None and hasattr(raw, "columns"):
+            try:
+                name_col = self.config.fault_config.get("name_column", "NAME")
+            except Exception:
+                name_col = "NAME"
+            if name_col in raw.columns:
+                raw[name_col] = raw[name_col].apply(
+                    lambda v: "nan" if pd.isna(v) else str(v)
+                )
+        return original(self)
+
+    patched._dms_patched = True
+    mapdata_mod.MapData.parse_fault_map = patched
+
+
 def _make_project(mode, source_dir, state, bbox, projection, config_path, loop_filename, verbose_level):
+    _patch_map2loop_v3_3_1_bugs()
     from map2loop.project import Project
     common = dict(
         working_projection=projection,
