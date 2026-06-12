@@ -146,6 +146,177 @@ def _safe_versions():
 
 # ---------- Stage 1-5: run map2loop ----------
 
+# ---------- preflight ----------
+
+# Minimums below which we hard-fail rather than letting map2loop crash deep
+# inside an interpolator. Tuned empirically — fewer than 2 geology features
+# means no contacts at all; fewer than 3 orientations means DBSCAN bails
+# even before scikit-learn complains.
+_MIN_GEOLOGY = 2
+_MIN_STRUCTURE = 3
+
+
+def _wfs_hits(layer_url_template: str, bbox: dict, timeout: int = 60) -> int:
+    """Return the count of features in `bbox` for a Loop3D WFS layer template."""
+    import re, urllib.request
+    bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
+    url = (
+        layer_url_template.replace("{BBOX_STR}", bbox_str)
+        .replace("outputFormat=shape-zip", "resultType=hits")
+        .replace("version=1.0.0", "version=2.0.0")
+        .replace("version=1.1.0", "version=2.0.0")
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return -1  # network failure — treat as unknown, let the run try
+    m = re.search(r'numberMatched="(\d+)"|numberReturned="(\d+)"|totalFeatures="(\d+)"', text)
+    if not m:
+        return -1
+    return int(next((g for g in m.groups() if g), 0))
+
+
+def _local_count_in_bbox(geojson_path: pathlib.Path, bbox: dict) -> int:
+    """Count features whose geometry intersects the bbox. Assumes file is already
+    in the working projection (or projection-less / lat-lon if the caller has
+    explicitly opted into reprojection elsewhere)."""
+    try:
+        import geopandas as gpd
+        from shapely.geometry import box
+        gdf = gpd.read_file(geojson_path)
+        roi = box(bbox["minx"], bbox["miny"], bbox["maxx"], bbox["maxy"])
+        return int(gdf.intersects(roi).sum())
+    except Exception:
+        return -1
+
+
+def _preflight(mode, source_dir, state, bbox, orientations_source, build_3d):
+    """Report data sufficiency upfront. Hard-fail when the pipeline can't run.
+
+    The point: a user with no orientations in their bbox should hear about it
+    in two seconds, not after 30 seconds of map2loop init and a deep DBSCAN
+    traceback.
+    """
+    print("[preflight] checking data sufficiency …")
+    counts = {"geology": None, "structure": None, "fault": None}
+
+    if mode == "bundled":
+        print("[preflight]   mode=bundled — using packaged Hamersley data ✓")
+        return
+
+    if mode == "wfs":
+        from map2loop.aus_state_urls import AustraliaStateUrls
+        for key, attr in (("geology", "aus_geology_urls"),
+                          ("structure", "aus_structure_urls"),
+                          ("fault", "aus_fault_urls")):
+            tpl = getattr(AustraliaStateUrls, attr).get(state, "")
+            if not tpl:
+                counts[key] = -1
+                continue
+            counts[key] = _wfs_hits(tpl, bbox)
+
+    elif mode == "local":
+        if source_dir is None:
+            raise SystemExit("--mode local requires --source-dir")
+        sd = pathlib.Path(source_dir).resolve()
+        def first(*names):
+            for n in names:
+                p = sd / n
+                if p.exists():
+                    return p
+            return None
+        files = {
+            "geology": first("geology.geojson", "geology.shp"),
+            "structure": first("structures.geojson", "structure.geojson", "structures.shp", "_fetched_waroxi.geojson"),
+            "fault": first("faults.geojson", "faults.shp"),
+        }
+        for key, p in files.items():
+            counts[key] = (_local_count_in_bbox(p, bbox) if p else 0)
+
+    # Augment structure count if hybrid fetch will fill it
+    will_fetch_waroxi = (
+        mode == "local"
+        and orientations_source == "loop3d-wfs"
+        and (counts["structure"] == 0 or counts["structure"] is None)
+    )
+    if will_fetch_waroxi:
+        from map2loop.aus_state_urls import AustraliaStateUrls
+        tpl = AustraliaStateUrls.aus_structure_urls.get("WA", "")
+        wfs_hits = _wfs_hits(tpl, bbox) if tpl else -1
+        counts["structure (Loop3D WFS)"] = wfs_hits
+
+    def _fmt(v):
+        if v is None: return "    ?"
+        if v < 0:    return "  n/a"  # couldn't determine (offline etc)
+        return f"{v:>5}"
+
+    for key, v in counts.items():
+        ok = (v is None or v < 0 or
+              (key.startswith("geology") and v >= _MIN_GEOLOGY) or
+              (key.startswith("structure") and v >= _MIN_STRUCTURE) or
+              (key.startswith("fault") and v >= 0))
+        marker = "✓" if ok else "✗"
+        print(f"[preflight]   {key:25s} : {_fmt(v)} features  {marker}")
+
+    # Decide whether to abort
+    problems, suggestions = [], []
+    g = counts.get("geology")
+    if g is not None and 0 <= g < _MIN_GEOLOGY:
+        problems.append(
+            f"Only {g} geology polygon(s) in this bbox — need at least {_MIN_GEOLOGY} "
+            "to extract contacts."
+        )
+        suggestions.append("Widen the bbox or pick a region with actual bedrock geology.")
+
+    s_local = counts.get("structure")
+    s_wfs = counts.get("structure (Loop3D WFS)")
+    s_effective = max(v for v in (s_local, s_wfs) if v is not None and v >= 0) if any(
+        v is not None and v >= 0 for v in (s_local, s_wfs)
+    ) else None
+
+    # map2loop's Project.__init__ requires structure_filename non-empty even for
+    # Stage 1-5 only, so we always hard-fail on missing orientations — there's
+    # no "--no-build-3d" escape hatch that actually helps.
+    if s_effective is not None and s_effective < _MIN_STRUCTURE:
+        problems.append(
+            f"Only {s_effective} bedding orientation(s) — map2loop needs at least "
+            f"{_MIN_STRUCTURE} to run (even for Stage 1-5; Project.__init__ "
+            "refuses to construct without structure data)."
+        )
+        if mode == "local" and orientations_source != "loop3d-wfs" and (s_local in (0, None)):
+            suggestions.append(
+                "Your --source-dir has no structures file. Either add one or "
+                "pass --orientations-from-loop3d-wfs to fetch WAROX from "
+                "Loop3D's WFS (works only inside outcrop-rich regions)."
+            )
+        if s_wfs == 0:
+            suggestions.append(
+                "Loop3D WFS WAROX has 0 points in this bbox — this region is "
+                "outside outcrop coverage (Murchison/Goldfields/Kalgoorlie). "
+                "Pick a bbox in the Pilbara/Hamersley, Capricorn Orogen, or "
+                "well-mapped Yilgarn outcrop areas."
+            )
+        if mode == "wfs" and not suggestions:
+            suggestions.append(
+                "Pick a bbox with WAROX coverage (Pilbara/Hamersley, Capricorn "
+                "Orogen, or well-mapped Yilgarn outcrop areas)."
+            )
+
+    if problems:
+        print()
+        print("[preflight] ✗ data is insufficient for the requested run:")
+        for p in problems:
+            print(f"    • {p}")
+        if suggestions:
+            print()
+            print("[preflight] Try one of:")
+            for s in suggestions:
+                print(f"    • {s}")
+        raise SystemExit(2)
+    print("[preflight] data looks OK to proceed")
+
+
 def _patch_map2loop_v3_3_1_bugs():
     """Monkey-patch map2loop 3.3.1 bugs that block WFS / local-data paths.
 
@@ -598,6 +769,15 @@ def main(argv=None):
     print(f"               out={out_dir}")
     print(f"               bbox={bbox}")
     print(f"               projection={projection}")
+
+    _preflight(
+        mode=args.mode,
+        source_dir=args.source_dir,
+        state=args.state,
+        bbox=bbox,
+        orientations_source=("loop3d-wfs" if args.orientations_from_loop3d_wfs else "local"),
+        build_3d=build_3d,
+    )
 
     print("[stage 1-5] running map2loop pipeline …")
     proj = _make_project(
