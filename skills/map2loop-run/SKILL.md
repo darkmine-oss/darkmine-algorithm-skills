@@ -78,6 +78,29 @@ python skills/map2loop-run/scripts/run_map2loop.py out-myproject/ \
     --build-3d
 ```
 
+### Hybrid: local geology + faults, but WAROX orientations from Loop3D WFS
+
+Many local data packs (e.g. exports from third-party explorer apps) include the
+geology polygons and fault lines but not bedding orientations or a DTM. Use
+`--orientations-from-loop3d-wfs` to fetch WAROX points from Loop3D's WFS for the
+bbox — and if you also omit a DTM file, map2loop falls back to a free SRTM30Plus
+fetch from the Pacific ERDDAP server (no API key needed). This unblocks Stage 6
+without waiting for your pack pipeline to add WAROX:
+
+```bash
+python skills/map2loop-run/scripts/run_map2loop.py out-hybrid/ \
+    --mode local --source-dir ~/explorer-pack/ \
+    --bbox 515687,7493447,562666,7521273,-3200,3000 \
+    --projection EPSG:28350 \
+    --config-json ~/explorer-pack/config.json \
+    --orientations-from-loop3d-wfs \
+    --build-3d
+```
+
+WAROX coverage is uneven — outcrop-rich areas (Pilbara, Capricorn Orogen,
+parts of the Yilgarn) have dense data; cover-dominated regions (Murchison,
+Goldfields) often return zero points and Stage 6 will refuse to run.
+
 The `--config-json` file must map your shapefile columns to map2loop's expected fields, e.g.:
 
 ```json

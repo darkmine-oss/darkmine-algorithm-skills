@@ -185,7 +185,7 @@ def _patch_map2loop_v3_3_1_bugs():
     mapdata_mod.MapData.parse_fault_map = patched
 
 
-def _make_project(mode, source_dir, state, bbox, projection, config_path, loop_filename, verbose_level):
+def _make_project(mode, source_dir, state, bbox, projection, config_path, loop_filename, verbose_level, orientations_source="local"):
     _patch_map2loop_v3_3_1_bugs()
     from map2loop.project import Project
     common = dict(
@@ -222,15 +222,67 @@ def _make_project(mode, source_dir, state, bbox, projection, config_path, loop_f
         config_kwargs = {}
         if config_path:
             config_kwargs["config_filename"] = str(pathlib.Path(config_path).resolve())
+        # Use the user's local files where present; fall back gracefully:
+        #   structure (orientations): if missing AND --orientations-from-loop3d-wfs
+        #     is set, fetch WAROX from Loop3D's WFS clipped to the bbox.
+        #   DTM: if missing, use the "hawaii" magic string that map2loop
+        #     already supports — pulls SRTM30Plus from a free Pacific ERDDAP
+        #     endpoint, no API key.
+        structure_path = first("structures.geojson", "structure.geojson", "structures.shp")
+        if not structure_path and orientations_source == "loop3d-wfs":
+            structure_path = _fetch_waroxi_for_bbox(bbox, sd / "_fetched_waroxi.geojson")
+        dtm_path = first("dtm.tif", "dtm_rp.tif")
+        if not dtm_path:
+            dtm_path = "hawaii"  # map2loop magic: SRTM30Plus via ERDDAP
         return Project(
             geology_filename=first("geology.geojson", "geology.shp"),
             fault_filename=first("faults.geojson", "faults.shp"),
-            structure_filename=first("structures.geojson", "structure.geojson", "structures.shp"),
-            dtm_filename=first("dtm.tif", "dtm_rp.tif"),
+            structure_filename=structure_path,
+            dtm_filename=dtm_path,
             **config_kwargs,
             **common,
         )
     raise SystemExit(f"Unknown mode {mode!r}")
+
+
+def _fetch_waroxi_for_bbox(bbox, out_path: pathlib.Path):
+    """Fetch WAROX orientation points from Loop3D's WFS for the bbox.
+
+    This is the explicit escape hatch for --mode local users whose data
+    pack doesn't include bedding orientations (e.g. exports from
+    The Explorer, which doesn't yet plumb the GSWA Open File WAROX bundle).
+    Returns the path the GeoJSON was written to, suitable to pass as
+    structure_filename. Raises SystemExit on network or empty-result errors.
+    """
+    import json, urllib.request, urllib.error
+    bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']},EPSG:28350"
+    url = (
+        "http://13.211.217.129:8080/geoserver/loop/wfs"
+        "?service=WFS&version=1.0.0&request=GetFeature"
+        "&typeName=loop:waroxi_wa_28350"
+        f"&bbox={bbox_str}&srs=EPSG:28350&outputFormat=application/json"
+    )
+    print(f"[orientations] fetching WAROX from Loop3D WFS for bbox …")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, OSError) as exc:
+        raise SystemExit(
+            f"Failed to reach Loop3D WFS for WAROX ({exc}). "
+            "If you're offline, omit --orientations-from-loop3d-wfs and supply "
+            "structures.geojson in --source-dir."
+        )
+    feats = data.get("features") or []
+    if not feats:
+        raise SystemExit(
+            "Loop3D WFS returned 0 WAROX features for this bbox — outside "
+            "WAROX coverage (Murchison/Kalgoorlie/Goldfields regions have no "
+            "outcrop measurements). Try a different bbox or supply your own."
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data))
+    print(f"[orientations] saved {len(feats)} WAROX points → {out_path.name}")
+    return str(out_path)
 
 
 def _run_pipeline(proj, sorter_name, spacing):
@@ -484,6 +536,12 @@ def main(argv=None):
     p.add_argument("--config-json", type=pathlib.Path, default=None,
                    help="For --mode local: JSON config mapping shapefile columns "
                         "to map2loop field names.")
+    p.add_argument("--orientations-from-loop3d-wfs", action="store_true",
+                   help="For --mode local: if your source-dir lacks a "
+                        "structures.geojson, fetch WAROX bedding orientations "
+                        "from Loop3D's WFS (clipped to bbox) and use those. "
+                        "Bridges packs that don't yet include WAROX (e.g. "
+                        "current Explorer exports). Network required.")
     p.add_argument("--sampler-spacing", type=float, default=200.0,
                    help="SamplerSpacing distance in metres (default: 200.0).")
     p.add_argument("--sorter", default="take_best",
@@ -551,6 +609,7 @@ def main(argv=None):
         config_path=args.config_json,
         loop_filename=loop_filename,
         verbose_level=verbose_level,
+        orientations_source=("loop3d-wfs" if args.orientations_from_loop3d_wfs else "local"),
     )
     map2loop_elapsed = _run_pipeline(proj, args.sorter, args.sampler_spacing)
     print(f"               done in {map2loop_elapsed:.1f}s → {loop_filename.name}")
