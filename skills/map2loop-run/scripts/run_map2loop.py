@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Darkmine Pty Ltd
+"""Run map2loop end-to-end and optionally build a 3D model via LoopStructural.
+
+Three input modes:
+
+* ``bundled`` — use the Hamersley geodata packaged inside map2loop
+  (reconstructs the case study from Jessell et al. 2021, GMD 14, 5063).
+* ``wfs`` — pull data from Loop's Web Feature Service for an Australian state.
+* ``local`` — point at a directory of user-supplied GeoJSONs + DTM.
+
+Always dumps a ``.loop3d`` file plus inspectable intermediate CSVs and a
+topology GML. With ``--build-3d`` (default for ``--mode bundled``) it also
+builds implicit surfaces via LoopStructural and exports VTK + interactive HTML.
+"""
+
+import argparse
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+from typing import Optional
+
+
+# ---------- bundled-Hamersley defaults (matches map2loop's plot_hamersley.py) ----------
+
+HAMERSLEY_BBOX = {
+    "minx": 515687.31005864,
+    "miny": 7493446.76593407,
+    "maxx": 562666.860106543,
+    "maxy": 7521273.57407786,
+    "base": -3200.0,
+    "top": 3000.0,
+}
+HAMERSLEY_PROJECTION = "EPSG:28350"
+HAMERSLEY_CONFIG = {
+    "structure": {"dipdir_column": "azimuth2", "dip_column": "dip"},
+    "geology": {"unitname_column": "unitname", "alt_unitname_column": "code"},
+    "fault": {"structtype_column": "feature", "fault_text": "Fault"},
+}
+
+# ---------- sorter registry ----------
+
+def _build_sorter(name: str, proj):
+    """Return a map2loop Sorter instance, or None for ``take_best``.
+
+    Some sorters (SorterAlpha, SorterMaximiseContacts, SorterObservationProjections)
+    require data that doesn't exist until after Project.run_all begins. For
+    ``take_best`` we skip set_sorter entirely — ``run_all(take_best=True)``
+    constructs its own sorter list internally. For the others we instantiate
+    with no args and let map2loop's deferred-attribute mechanism populate the
+    rest once contacts/relationships are ready.
+    """
+    if name == "take_best":
+        return None
+    from map2loop.sorter import (
+        SorterAgeBased,
+        SorterUseHint,
+        SorterUseNetworkX,
+        SorterMaximiseContacts,
+        SorterObservationProjections,
+    )
+    no_arg_mapping = {
+        "age":        SorterAgeBased,
+        "hint":       SorterUseHint,
+        "networkx":   SorterUseNetworkX,
+        "maximise":   SorterMaximiseContacts,
+        "projection": SorterObservationProjections,
+    }
+    if name == "alpha":
+        # SorterAlpha needs contacts at construct time, which don't exist until
+        # run_all extracts them. Pre-run the contact extractor to satisfy it.
+        from map2loop.sorter import SorterAlpha
+        from map2loop.contact_extractor import ContactExtractor
+        from map2loop.m2l_enums import Datatype
+        proj.contact_extractor = ContactExtractor(
+            proj.map_data.get_map_data(Datatype.GEOLOGY),
+            proj.map_data.get_map_data(Datatype.FAULT),
+        )
+        proj.contact_extractor.extract_all_contacts()
+        return SorterAlpha(contacts=proj.contact_extractor.contacts)
+    if name in no_arg_mapping:
+        return no_arg_mapping[name]()
+    raise SystemExit(
+        f"Unknown sorter {name!r}. Valid: alpha, age, hint, networkx, "
+        "maximise, projection, take_best."
+    )
+
+
+# ---------- I/O helpers ----------
+
+def _parse_bbox(arg: Optional[str]):
+    if arg is None:
+        return None
+    parts = [float(x) for x in arg.split(",")]
+    if len(parts) != 6:
+        raise SystemExit(
+            "--bbox must be MINX,MINY,MAXX,MAXY,BASE,TOP (6 floats)."
+        )
+    keys = ("minx", "miny", "maxx", "maxy", "base", "top")
+    return dict(zip(keys, parts))
+
+
+def _hamersley_data_dir() -> pathlib.Path:
+    import map2loop
+    root = pathlib.Path(map2loop.__file__).parent / "_datasets" / "geodata_files" / "hamersley"
+    if not root.exists():
+        raise SystemExit(
+            f"map2loop's bundled Hamersley data not found at {root}. "
+            "Reinstall map2loop or use --mode wfs / --mode local."
+        )
+    return root
+
+
+def _git_rev(start: pathlib.Path) -> Optional[str]:
+    if not shutil.which("git"):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _safe_versions():
+    import map2loop
+    versions = {"map2loop": getattr(map2loop, "__version__", "unknown")}
+    try:
+        import LoopStructural
+        versions["LoopStructural"] = getattr(LoopStructural, "__version__", "unknown")
+    except Exception:
+        versions["LoopStructural"] = None
+    try:
+        import LoopProjectFile
+        versions["LoopProjectFile"] = getattr(LoopProjectFile, "__version__", "unknown")
+    except Exception:
+        versions["LoopProjectFile"] = None
+    return versions
+
+
+# ---------- Stage 1-5: run map2loop ----------
+
+# ---------- preflight ----------
+
+# Minimums below which we hard-fail rather than letting map2loop crash deep
+# inside an interpolator. Tuned empirically — fewer than 2 geology features
+# means no contacts at all; fewer than 3 orientations means DBSCAN bails
+# even before scikit-learn complains.
+_MIN_GEOLOGY = 2
+_MIN_STRUCTURE = 3
+
+
+def _wfs_hits(layer_url_template: str, bbox: dict, timeout: int = 60) -> int:
+    """Return the count of features in `bbox` for a Loop3D WFS layer template."""
+    import re, urllib.request
+    bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
+    url = (
+        layer_url_template.replace("{BBOX_STR}", bbox_str)
+        .replace("outputFormat=shape-zip", "resultType=hits")
+        .replace("version=1.0.0", "version=2.0.0")
+        .replace("version=1.1.0", "version=2.0.0")
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return -1  # network failure — treat as unknown, let the run try
+    m = re.search(r'numberMatched="(\d+)"|numberReturned="(\d+)"|totalFeatures="(\d+)"', text)
+    if not m:
+        return -1
+    return int(next((g for g in m.groups() if g), 0))
+
+
+def _local_count_in_bbox(geojson_path: pathlib.Path, bbox: dict) -> int:
+    """Count features whose geometry intersects the bbox. Assumes file is already
+    in the working projection (or projection-less / lat-lon if the caller has
+    explicitly opted into reprojection elsewhere)."""
+    try:
+        import geopandas as gpd
+        from shapely.geometry import box
+        gdf = gpd.read_file(geojson_path)
+        roi = box(bbox["minx"], bbox["miny"], bbox["maxx"], bbox["maxy"])
+        return int(gdf.intersects(roi).sum())
+    except Exception:
+        return -1
+
+
+def _preflight(mode, source_dir, state, bbox, orientations_source, build_3d):
+    """Report data sufficiency upfront. Hard-fail when the pipeline can't run.
+
+    The point: a user with no orientations in their bbox should hear about it
+    in two seconds, not after 30 seconds of map2loop init and a deep DBSCAN
+    traceback.
+    """
+    print("[preflight] checking data sufficiency …")
+    counts = {"geology": None, "structure": None, "fault": None}
+
+    if mode == "bundled":
+        print("[preflight]   mode=bundled — using packaged Hamersley data ✓")
+        return
+
+    if mode == "wfs":
+        from map2loop.aus_state_urls import AustraliaStateUrls
+        for key, attr in (("geology", "aus_geology_urls"),
+                          ("structure", "aus_structure_urls"),
+                          ("fault", "aus_fault_urls")):
+            tpl = getattr(AustraliaStateUrls, attr).get(state, "")
+            if not tpl:
+                counts[key] = -1
+                continue
+            counts[key] = _wfs_hits(tpl, bbox)
+
+    elif mode == "local":
+        if source_dir is None:
+            raise SystemExit("--mode local requires --source-dir")
+        sd = pathlib.Path(source_dir).resolve()
+        def first(*names):
+            for n in names:
+                p = sd / n
+                if p.exists():
+                    return p
+            return None
+        files = {
+            "geology": first("geology.geojson", "geology.shp"),
+            "structure": first("structures.geojson", "structure.geojson", "structures.shp", "_fetched_waroxi.geojson"),
+            "fault": first("faults.geojson", "faults.shp"),
+        }
+        for key, p in files.items():
+            counts[key] = (_local_count_in_bbox(p, bbox) if p else 0)
+
+    # Augment structure count if hybrid fetch will fill it
+    will_fetch_waroxi = (
+        mode == "local"
+        and orientations_source == "loop3d-wfs"
+        and (counts["structure"] == 0 or counts["structure"] is None)
+    )
+    if will_fetch_waroxi:
+        from map2loop.aus_state_urls import AustraliaStateUrls
+        tpl = AustraliaStateUrls.aus_structure_urls.get("WA", "")
+        wfs_hits = _wfs_hits(tpl, bbox) if tpl else -1
+        counts["structure (Loop3D WFS)"] = wfs_hits
+
+    def _fmt(v):
+        if v is None: return "    ?"
+        if v < 0:    return "  n/a"  # couldn't determine (offline etc)
+        return f"{v:>5}"
+
+    for key, v in counts.items():
+        ok = (v is None or v < 0 or
+              (key.startswith("geology") and v >= _MIN_GEOLOGY) or
+              (key.startswith("structure") and v >= _MIN_STRUCTURE) or
+              (key.startswith("fault") and v >= 0))
+        marker = "✓" if ok else "✗"
+        print(f"[preflight]   {key:25s} : {_fmt(v)} features  {marker}")
+
+    # Decide whether to abort
+    problems, suggestions = [], []
+    g = counts.get("geology")
+    if g is not None and 0 <= g < _MIN_GEOLOGY:
+        problems.append(
+            f"Only {g} geology polygon(s) in this bbox — need at least {_MIN_GEOLOGY} "
+            "to extract contacts."
+        )
+        suggestions.append("Widen the bbox or pick a region with actual bedrock geology.")
+
+    s_local = counts.get("structure")
+    s_wfs = counts.get("structure (Loop3D WFS)")
+    s_effective = max(v for v in (s_local, s_wfs) if v is not None and v >= 0) if any(
+        v is not None and v >= 0 for v in (s_local, s_wfs)
+    ) else None
+
+    # map2loop's Project.__init__ requires structure_filename non-empty even for
+    # Stage 1-5 only, so we always hard-fail on missing orientations — there's
+    # no "--no-build-3d" escape hatch that actually helps.
+    if s_effective is not None and s_effective < _MIN_STRUCTURE:
+        problems.append(
+            f"Only {s_effective} bedding orientation(s) — map2loop needs at least "
+            f"{_MIN_STRUCTURE} to run (even for Stage 1-5; Project.__init__ "
+            "refuses to construct without structure data)."
+        )
+        if mode == "local" and orientations_source != "loop3d-wfs" and (s_local in (0, None)):
+            suggestions.append(
+                "Your --source-dir has no structures file. Either add one or "
+                "pass --orientations-from-loop3d-wfs to fetch WAROX from "
+                "Loop3D's WFS (works only inside outcrop-rich regions)."
+            )
+        if s_wfs == 0:
+            suggestions.append(
+                "Loop3D WFS WAROX has 0 points in this bbox — this region is "
+                "outside outcrop coverage (Murchison/Goldfields/Kalgoorlie). "
+                "Pick a bbox in the Pilbara/Hamersley, Capricorn Orogen, or "
+                "well-mapped Yilgarn outcrop areas."
+            )
+        if mode == "wfs" and not suggestions:
+            suggestions.append(
+                "Pick a bbox with WAROX coverage (Pilbara/Hamersley, Capricorn "
+                "Orogen, or well-mapped Yilgarn outcrop areas)."
+            )
+
+    if problems:
+        print()
+        print("[preflight] ✗ data is insufficient for the requested run:")
+        for p in problems:
+            print(f"    • {p}")
+        if suggestions:
+            print()
+            print("[preflight] Try one of:")
+            for s in suggestions:
+                print(f"    • {s}")
+        raise SystemExit(2)
+    print("[preflight] data looks OK to proceed")
+
+
+def _patch_map2loop_v3_3_1_bugs():
+    """Monkey-patch map2loop 3.3.1 bugs that block WFS / local-data paths.
+
+    1. mapdata.MapData.parse_fault_map line 1123 does ``fault["NAME"].lower()``
+       which throws AttributeError when NAME is a float NaN. The bundled
+       Hamersley demo has every fault NAMEd, so this never fires there, but
+       Loop3D's WFS-fed WAROX fault data leaves many faults unnamed.
+       Pre-coerce NaN names to the literal string ``"nan"`` before the
+       original method runs; the original then replaces ``"nan"`` with a
+       generated ``Fault_<ID>``.
+    """
+    import map2loop.mapdata as mapdata_mod
+    import pandas as pd
+    if getattr(mapdata_mod.MapData.parse_fault_map, "_dms_patched", False):
+        return
+    original = mapdata_mod.MapData.parse_fault_map
+
+    def patched(self):
+        # raw_data is a list indexed by Datatype enum (IntEnum). Guard for
+        # both shape and presence — some load paths leave the slot None.
+        try:
+            raw = self.raw_data[int(mapdata_mod.Datatype.FAULT)]
+        except Exception:
+            raw = None
+        if raw is not None and hasattr(raw, "columns"):
+            try:
+                name_col = self.config.fault_config.get("name_column", "NAME")
+            except Exception:
+                name_col = "NAME"
+            if name_col in raw.columns:
+                raw[name_col] = raw[name_col].apply(
+                    lambda v: "nan" if pd.isna(v) else str(v)
+                )
+        return original(self)
+
+    patched._dms_patched = True
+    mapdata_mod.MapData.parse_fault_map = patched
+
+
+def _make_project(mode, source_dir, state, bbox, projection, config_path, loop_filename, verbose_level, orientations_source="local"):
+    _patch_map2loop_v3_3_1_bugs()
+    from map2loop.project import Project
+    common = dict(
+        working_projection=projection,
+        bounding_box=bbox,
+        verbose_level=verbose_level,
+        loop_project_filename=str(loop_filename),
+        overwrite_loopprojectfile=True,
+    )
+    if mode == "bundled":
+        data = _hamersley_data_dir()
+        return Project(
+            geology_filename=str(data / "geology.geojson"),
+            fault_filename=str(data / "faults.geojson"),
+            structure_filename=str(data / "structures.geojson"),
+            dtm_filename=str(data / "dtm_rp.tif"),
+            config_dictionary=HAMERSLEY_CONFIG,
+            **common,
+        )
+    if mode == "wfs":
+        return Project(use_australian_state_data=state, **common)
+    if mode == "local":
+        if source_dir is None:
+            raise SystemExit("--mode local requires --source-dir")
+        sd = pathlib.Path(source_dir).resolve()
+        if not sd.is_dir():
+            raise SystemExit(f"--source-dir not found: {sd}")
+        def first(*names):
+            for n in names:
+                p = sd / n
+                if p.exists():
+                    return str(p)
+            return ""
+        config_kwargs = {}
+        if config_path:
+            config_kwargs["config_filename"] = str(pathlib.Path(config_path).resolve())
+        # Use the user's local files where present; fall back gracefully:
+        #   structure (orientations): if missing AND --orientations-from-loop3d-wfs
+        #     is set, fetch WAROX from Loop3D's WFS clipped to the bbox.
+        #   DTM: if missing, use the "hawaii" magic string that map2loop
+        #     already supports — pulls SRTM30Plus from a free Pacific ERDDAP
+        #     endpoint, no API key.
+        structure_path = first("structures.geojson", "structure.geojson", "structures.shp")
+        if not structure_path and orientations_source == "loop3d-wfs":
+            structure_path = _fetch_waroxi_for_bbox(bbox, sd / "_fetched_waroxi.geojson")
+        dtm_path = first("dtm.tif", "dtm_rp.tif")
+        if not dtm_path:
+            dtm_path = "hawaii"  # map2loop magic: SRTM30Plus via ERDDAP
+        return Project(
+            geology_filename=first("geology.geojson", "geology.shp"),
+            fault_filename=first("faults.geojson", "faults.shp"),
+            structure_filename=structure_path,
+            dtm_filename=dtm_path,
+            **config_kwargs,
+            **common,
+        )
+    raise SystemExit(f"Unknown mode {mode!r}")
+
+
+def _fetch_waroxi_for_bbox(bbox, out_path: pathlib.Path):
+    """Fetch WAROX orientation points from Loop3D's WFS for the bbox.
+
+    This is the explicit escape hatch for --mode local users whose data
+    pack doesn't include bedding orientations (e.g. exports from
+    The Explorer, which doesn't yet plumb the GSWA Open File WAROX bundle).
+    Returns the path the GeoJSON was written to, suitable to pass as
+    structure_filename. Raises SystemExit on network or empty-result errors.
+    """
+    import json, urllib.request, urllib.error
+    bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']},EPSG:28350"
+    url = (
+        "http://13.211.217.129:8080/geoserver/loop/wfs"
+        "?service=WFS&version=1.0.0&request=GetFeature"
+        "&typeName=loop:waroxi_wa_28350"
+        f"&bbox={bbox_str}&srs=EPSG:28350&outputFormat=application/json"
+    )
+    print(f"[orientations] fetching WAROX from Loop3D WFS for bbox …")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, OSError) as exc:
+        raise SystemExit(
+            f"Failed to reach Loop3D WFS for WAROX ({exc}). "
+            "If you're offline, omit --orientations-from-loop3d-wfs and supply "
+            "structures.geojson in --source-dir."
+        )
+    feats = data.get("features") or []
+    if not feats:
+        raise SystemExit(
+            "Loop3D WFS returned 0 WAROX features for this bbox — outside "
+            "WAROX coverage (Murchison/Kalgoorlie/Goldfields regions have no "
+            "outcrop measurements). Try a different bbox or supply your own."
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data))
+    print(f"[orientations] saved {len(feats)} WAROX points → {out_path.name}")
+    return str(out_path)
+
+
+def _run_pipeline(proj, sorter_name, spacing):
+    from map2loop.m2l_enums import Datatype
+    from map2loop.sampler import SamplerSpacing
+    proj.set_sampler(Datatype.GEOLOGY, SamplerSpacing(spacing))
+    proj.set_sampler(Datatype.FAULT, SamplerSpacing(spacing))
+    take_best = sorter_name == "take_best"
+    sorter = _build_sorter(sorter_name, proj)
+    if sorter is not None:
+        proj.set_sorter(sorter)
+    t0 = time.monotonic()
+    proj.run_all(take_best=take_best)
+    return time.monotonic() - t0
+
+
+# ---------- intermediate-artifact dumps ----------
+
+def _to_csv(df, out_path: pathlib.Path):
+    """Best-effort CSV dump; tolerate None / empty / non-DataFrame."""
+    if df is None:
+        return False
+    try:
+        if hasattr(df, "to_csv"):
+            df.to_csv(out_path, index=False)
+            return True
+    except Exception as exc:
+        print(f"  ! could not write {out_path.name}: {exc}")
+    return False
+
+
+def _dump_intermediates(proj, out_dir: pathlib.Path):
+    dumps = {}
+    sc = getattr(proj, "stratigraphic_column", None)
+    if sc is not None and hasattr(sc, "stratigraphicUnits"):
+        dumps["stratigraphy.csv"] = _to_csv(sc.stratigraphicUnits, out_dir / "stratigraphy.csv")
+    md = getattr(proj, "map_data", None)
+    if md is not None:
+        dumps["contacts.csv"] = _to_csv(getattr(md, "sampled_contacts", None), out_dir / "contacts.csv")
+        # Orientations: map_data.STRUCTURE is the raw GeoDataFrame of bedding
+        # measurements (X, Y, dip, dipdir, ...). map2loop doesn't "sample"
+        # structures because they're already point data.
+        dumps["orientations.csv"] = _to_csv(getattr(md, "STRUCTURE", None), out_dir / "orientations.csv")
+    topo = getattr(proj, "topology", None)
+    if topo is not None:
+        # map2loop stores topology as three pandas DataFrames (not a graph).
+        # Dump each as CSV — they're directly visualisable in Excel/QGIS and
+        # can be loaded into NetworkX or yEd by the user if a graph is wanted.
+        for attr, fname in (
+            ("unit_unit_relationships",   "topology_unit_unit.csv"),
+            ("unit_fault_relationships",  "topology_unit_fault.csv"),
+            ("fault_fault_relationships", "topology_fault_fault.csv"),
+        ):
+            dumps[fname] = _to_csv(getattr(topo, attr, None), out_dir / fname)
+    return dumps
+
+
+# ---------- Stage 6: LoopStructural ----------
+
+def _patch_fault_stratigraphy(processor):
+    """Wire every fault to every stratigraphic supergroup on the processor.
+
+    `LoopProjectfileProcessor.__init__` (LoopStructural 1.6.27) hardcodes
+    ``fault_stratigraphy=None``, so when ``GeologicalModel.from_processor``
+    later calls ``create_and_add_foliation(s, faults=None)``, the resulting
+    stratigraphy feature has zero fault regions. The implicit foliation
+    field is then smooth across faults and the extracted isosurfaces don't
+    show fault offset — even though the faults are interpolated as separate
+    features and exist in the model.
+
+    Default to the standard LoopStructural assumption: every fault cuts every
+    stratigraphic supergroup. If the source data later provides per-unit
+    fault relationships (map2loop's topology_unit_fault.csv has them), this
+    is the entry point to apply that finer mapping.
+    """
+    if processor is None:
+        return
+    if getattr(processor, "fault_stratigraphy", None) is not None:
+        return  # caller already populated; respect it
+    fnet = getattr(processor, "fault_network", None)
+    if fnet is None:
+        return
+    fault_names = list(getattr(fnet, "faults", []) or [])
+    if not fault_names:
+        return
+    sc = getattr(processor, "stratigraphic_column", None) or {}
+    supergroups = [k for k in sc.keys() if k != "faults"]
+    if not supergroups:
+        return
+    # fault_stratigraphy is a property with no setter; write to the backing
+    # field directly. Same field ProcessInputData.__init__ assigns to.
+    processor._fault_stratigraphy = {sg: list(fault_names) for sg in supergroups}
+
+
+def _iter_stratigraphic_surfaces(model):
+    """Yield (name, pyvista mesh) for each well-extractable stratigraphic horizon.
+
+    Bypasses LoopStructural 1.6.27's `GeologicalModel.get_stratigraphic_surfaces()`
+    which uses `stratigraphic_column.get_isovalues()` — that method is broken
+    here and returns `value=inf` for every unit except the first, so only one
+    horizon survives. Instead we pull each unit's `min` value out of the
+    processor's stratigraphic_column (which carries the cumulative-thickness
+    isovalues correctly) and call `feature.surfaces()` directly per supergroup.
+
+    Boundary units with `min=-inf` or `max=+inf` are skipped (their isovalues
+    are open-ended sentinels, not real surfaces).
+    """
+    processor = getattr(model, "_wrapper_processor", None)
+    if processor is None or not getattr(processor, "stratigraphic_column", None):
+        # Fall back to LoopStructural's own iterator (may produce 1 surface).
+        for s in model.get_stratigraphic_surfaces():
+            mesh = s.vtk() if hasattr(s, "vtk") else None
+            if mesh is not None and mesh.n_points > 0:
+                yield (getattr(s, "name", None) or "unit"), mesh
+        return
+    import math
+    for group, units in processor.stratigraphic_column.items():
+        if group == "faults":
+            continue
+        feature = model.get_feature_by_name(group)
+        if feature is None:
+            continue
+        values, names = [], []
+        for unit_name, info in units.items():
+            v = info.get("min")
+            if v is None or not math.isfinite(v):
+                continue
+            values.append(float(v))
+            names.append(unit_name)
+        if not values:
+            continue
+        try:
+            surfaces = feature.surfaces(values, model.bounding_box, name=names)
+        except Exception as exc:
+            print(f"  ! feature.surfaces({group}) failed: {exc}")
+            continue
+        for s in surfaces:
+            mesh = s.vtk() if hasattr(s, "vtk") else None
+            if mesh is not None and mesh.n_points > 0:
+                yield getattr(s, "name", "unit"), mesh
+
+
+
+def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats):
+    """Load the .loop3d, build implicit surfaces, dump VTK + HTML."""
+    try:
+        from LoopProjectFile import ProjectFile
+        from LoopStructural.modelling.input.project_file import LoopProjectfileProcessor
+        from LoopStructural import GeologicalModel
+    except ImportError as exc:
+        print(f"  ! LoopStructural import failed ({exc}); skipping --build-3d")
+        return {}
+    pf = ProjectFile(str(loop_filename))
+    processor = LoopProjectfileProcessor(pf)
+    # Patch: LoopProjectfileProcessor hardcodes fault_stratigraphy=None, which
+    # means create_and_add_foliation never receives a `faults=` list. The
+    # result: the stratigraphy interpolator has no fault regions, so the
+    # implicit field is smooth across faults and the extracted isosurfaces
+    # are continuous meshes that don't show fault offset. Populate it with
+    # every fault cutting every supergroup so the foliations get fault
+    # regions added and surfaces clip correctly at fault planes.
+    _patch_fault_stratigraphy(processor)
+    model = GeologicalModel.from_processor(processor)
+    model.update()
+    # Cache the processor on the model so _iter_stratigraphic_surfaces can
+    # read the correct per-unit isovalues. LoopStructural 1.6.27's
+    # stratigraphic_column.get_isovalues() returns value=inf for every unit
+    # except the first, so the default model.get_stratigraphic_surfaces()
+    # produces only 1/N surfaces. We bypass it by feeding the correct
+    # isovalues from the processor directly into feature.surfaces().
+    model._wrapper_processor = processor
+    exported = {}
+    if "vtk" in export_formats:
+        try:
+            import pyvista as pv
+            blocks = pv.MultiBlock()
+            for name, mesh in _iter_stratigraphic_surfaces(model):
+                blocks[name] = mesh
+            try:
+                for f in model.get_fault_surfaces():
+                    name = getattr(f, "name", None) or "fault"
+                    blocks[name] = f.vtk()
+            except Exception as exc:
+                print(f"  ! fault surfaces export skipped: {exc}")
+            blocks.save(str(out_dir / "model.vtm"))
+            exported["model.vtm"] = True
+        except Exception as exc:
+            print(f"  ! VTK export failed: {exc}")
+            exported["model.vtm"] = False
+    if "html" in export_formats or "png" in export_formats:
+        try:
+            import pyvista as pv
+            # Build a fresh plotter from the surfaces we just collected.
+            # pyvista's export_html (via trame) bakes the geometry as base64
+            # but the resulting page won't load over file:// in most browsers
+            # because it uses <script type="module"> — so we always also
+            # write a PNG screenshot (works everywhere, no server needed).
+            plotter = pv.Plotter(off_screen=True, window_size=(1600, 1200))
+            strati_count = fault_count = 0
+            colors = ["#1932e2", "#628304", "#5fb3c5", "#5d7e60", "#f48b70",
+                      "#a2f290", "#e7f2f3", "#0c2562", "#d0d47c", "#387866", "#106e8a"]
+            for i, (name, mesh) in enumerate(_iter_stratigraphic_surfaces(model)):
+                plotter.add_mesh(mesh, color=colors[i % len(colors)],
+                                 name=name,
+                                 show_scalar_bar=False, opacity=0.85)
+                strati_count += 1
+            try:
+                for f in model.get_fault_surfaces():
+                    mesh = f.vtk()
+                    if mesh is not None and mesh.n_points > 0:
+                        plotter.add_mesh(mesh, color="black",
+                                         name=getattr(f, "name", None),
+                                         show_scalar_bar=False, opacity=0.4)
+                        fault_count += 1
+            except Exception as exc:
+                print(f"  ! fault surfaces export skipped: {exc}")
+            plotter.show_axes()
+            plotter.camera.azimuth = 30
+            plotter.camera.elevation = -25
+            print(f"               (3D scene: {strati_count} stratigraphic + {fault_count} fault surfaces)")
+            if "png" in export_formats:
+                plotter.screenshot(str(out_dir / "model.png"))
+                exported["model.png"] = True
+            if "html" in export_formats:
+                html_path = out_dir / "model.html"
+                plotter.export_html(str(html_path))
+                _patch_html_load_order(html_path)
+                _write_html_helper(out_dir)
+                exported["model.html"] = True
+            plotter.close()
+        except Exception as exc:
+            print(f"  ! 3D export failed: {exc}")
+    return exported
+
+
+def _patch_html_load_order(html_path: pathlib.Path):
+    """Defer the OfflineLocalView.load call until the ES module is ready.
+
+    pyvista / trame_vtk write an inline non-module <script> at the end of
+    the HTML that calls OfflineLocalView.load(...) directly. That script
+    runs synchronously during HTML parsing, before the <script type=\"module\">
+    above has evaluated and exposed OfflineLocalView — so the call hits
+    'OfflineLocalView is not defined' and the viewer renders blank.
+    Wrap the call in a poll loop that waits for the symbol to appear.
+    """
+    text = html_path.read_text()
+    needle = "OfflineLocalView.load(container, { base64Str });"
+    if needle not in text:
+        return
+    fixed = (
+        "(function waitForVTK(){\n"
+        "  if (typeof OfflineLocalView !== 'undefined') {\n"
+        "    OfflineLocalView.load(container, { base64Str });\n"
+        "  } else { setTimeout(waitForVTK, 50); }\n"
+        "})();"
+    )
+    html_path.write_text(text.replace(needle, fixed))
+
+
+def _write_html_helper(out_dir: pathlib.Path):
+    """Write a one-liner shell script that serves model.html over HTTP."""
+    helper = out_dir / "serve_model_html.sh"
+    helper.write_text(
+        "#!/usr/bin/env bash\n"
+        "# model.html uses ES modules; some browsers block them over file://.\n"
+        "# This helper serves the dir over HTTP so the viewer always loads.\n"
+        'cd "$(dirname "$0")" || exit 1\n'
+        "PORT=${1:-8765}\n"
+        'echo "Open http://localhost:${PORT}/model.html in your browser"\n'
+        'python3 -m http.server "$PORT"\n'
+    )
+    helper.chmod(0o755)
+
+
+# ---------- main ----------
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("out_dir", type=pathlib.Path,
+                   help="Output directory (created if absent).")
+    p.add_argument("--mode", choices=("bundled", "wfs", "local"), default="bundled")
+    p.add_argument("--source-dir", type=pathlib.Path, default=None,
+                   help="For --mode local: directory of geology/faults/structures GeoJSON + DTM.")
+    p.add_argument("--state", default="WA",
+                   help="For --mode wfs: Australian state code "
+                        "(WA, SA, NSW, VIC, QLD, TAS, NT).")
+    p.add_argument("--bbox", default=None,
+                   help="MINX,MINY,MAXX,MAXY,BASE,TOP. Required for wfs/local; "
+                        "defaults to bundled-Hamersley bbox for --mode bundled.")
+    p.add_argument("--projection", default=None,
+                   help="Working projection (e.g. EPSG:28350). "
+                        "Required for wfs/local; defaults to EPSG:28350 for bundled.")
+    p.add_argument("--config-json", type=pathlib.Path, default=None,
+                   help="For --mode local: JSON config mapping shapefile columns "
+                        "to map2loop field names.")
+    p.add_argument("--orientations-from-loop3d-wfs", action="store_true",
+                   help="For --mode local: if your source-dir lacks a "
+                        "structures.geojson, fetch WAROX bedding orientations "
+                        "from Loop3D's WFS (clipped to bbox) and use those. "
+                        "Bridges packs that don't yet include WAROX (e.g. "
+                        "current Explorer exports). Network required.")
+    p.add_argument("--sampler-spacing", type=float, default=200.0,
+                   help="SamplerSpacing distance in metres (default: 200.0).")
+    p.add_argument("--sorter", default="take_best",
+                   choices=("alpha", "age", "hint", "networkx",
+                            "maximise", "projection", "take_best"),
+                   help="Stratigraphic sorter (default: take_best — sweeps all six "
+                        "and picks the highest-scoring).")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--build-3d", action="store_true", default=None,
+                   help="Build 3D surfaces via LoopStructural after map2loop runs.")
+    g.add_argument("--no-build-3d", action="store_true",
+                   help="Skip the LoopStructural step (default for wfs/local).")
+    p.add_argument("--export", default="vtk,html,png",
+                   help="Comma-separated 3D export formats: any of vtk, html, png "
+                        "(default: vtk,html,png). 'vtk' writes a MultiBlock .vtm "
+                        "for ParaView; 'png' is the always-viewable screenshot; "
+                        "'html' is interactive but needs HTTP serving — see the "
+                        "serve_model_html.sh helper that's written alongside.")
+    p.add_argument("--loop-filename", default="output.loop3d",
+                   help="Filename for the .loop3d output (default: output.loop3d).")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress map2loop progress lines.")
+    args = p.parse_args(argv)
+
+    # Resolve bbox/projection defaults for bundled mode.
+    if args.mode == "bundled":
+        bbox = _parse_bbox(args.bbox) if args.bbox else dict(HAMERSLEY_BBOX)
+        projection = args.projection or HAMERSLEY_PROJECTION
+    else:
+        bbox = _parse_bbox(args.bbox)
+        projection = args.projection
+        if bbox is None or projection is None:
+            p.error(f"--mode {args.mode} requires --bbox and --projection.")
+
+    # Build-3d default: on for bundled, off otherwise (unless --build-3d).
+    if args.no_build_3d:
+        build_3d = False
+    elif args.build_3d is None:
+        build_3d = (args.mode == "bundled")
+    else:
+        build_3d = bool(args.build_3d)
+
+    export_formats = [s.strip() for s in args.export.split(",") if s.strip()]
+
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    loop_filename = out_dir / args.loop_filename
+
+    from map2loop.m2l_enums import VerboseLevel
+    verbose_level = VerboseLevel.NONE if args.quiet else VerboseLevel.TEXTONLY
+
+    started = time.time()
+    print(f"[map2loop-run] mode={args.mode} sorter={args.sorter} build_3d={build_3d}")
+    print(f"               out={out_dir}")
+    print(f"               bbox={bbox}")
+    print(f"               projection={projection}")
+
+    _preflight(
+        mode=args.mode,
+        source_dir=args.source_dir,
+        state=args.state,
+        bbox=bbox,
+        orientations_source=("loop3d-wfs" if args.orientations_from_loop3d_wfs else "local"),
+        build_3d=build_3d,
+    )
+
+    print("[stage 1-5] running map2loop pipeline …")
+    proj = _make_project(
+        mode=args.mode,
+        source_dir=args.source_dir,
+        state=args.state,
+        bbox=bbox,
+        projection=projection,
+        config_path=args.config_json,
+        loop_filename=loop_filename,
+        verbose_level=verbose_level,
+        orientations_source=("loop3d-wfs" if args.orientations_from_loop3d_wfs else "local"),
+    )
+    map2loop_elapsed = _run_pipeline(proj, args.sorter, args.sampler_spacing)
+    print(f"               done in {map2loop_elapsed:.1f}s → {loop_filename.name}")
+
+    print("[intermediates] dumping CSVs + topology GML …")
+    dumps = _dump_intermediates(proj, out_dir)
+    for name, ok in dumps.items():
+        print(f"               {name}: {'wrote' if ok else 'skipped'}")
+
+    exports = {}
+    build_elapsed = None
+    if build_3d:
+        print(f"[stage 6] building 3D model via LoopStructural ({','.join(export_formats)}) …")
+        t0 = time.monotonic()
+        exports = _build_3d(loop_filename, out_dir, export_formats)
+        build_elapsed = time.monotonic() - t0
+        for name, ok in exports.items():
+            print(f"               {name}: {'wrote' if ok else 'failed'}")
+
+    summary = {
+        "started_at": started,
+        "mode": args.mode,
+        "state": args.state if args.mode == "wfs" else None,
+        "source_dir": str(args.source_dir.resolve()) if args.source_dir else None,
+        "bbox": bbox,
+        "projection": projection,
+        "sampler_spacing_m": args.sampler_spacing,
+        "sorter": args.sorter,
+        "build_3d": build_3d,
+        "export_formats": export_formats if build_3d else [],
+        "loop_filename": str(loop_filename),
+        "intermediates": dumps,
+        "exports": exports,
+        "map2loop_elapsed_s": map2loop_elapsed,
+        "stage6_elapsed_s": build_elapsed,
+        "versions": _safe_versions(),
+        "skill_git_rev": _git_rev(pathlib.Path(__file__).resolve().parent),
+    }
+    (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2, default=str))
+
+    print()
+    print("=== map2loop-run complete ===")
+    print(f"  loop project file: {loop_filename}")
+    print(f"  summary:           {out_dir / 'run_summary.json'}")
+    if build_3d and exports:
+        for name in exports:
+            print(f"  3D export:         {out_dir / name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

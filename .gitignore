@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Envs
+.venv/
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Claude
+.claude/
+
+# map2loop / LoopStructural scratch output
+m2l_data_tmp/
+*.loop3d
+out/
