@@ -513,6 +513,41 @@ def _dump_intermediates(proj, out_dir: pathlib.Path):
 
 # ---------- Stage 6: LoopStructural ----------
 
+def _patch_fault_stratigraphy(processor):
+    """Wire every fault to every stratigraphic supergroup on the processor.
+
+    `LoopProjectfileProcessor.__init__` (LoopStructural 1.6.27) hardcodes
+    ``fault_stratigraphy=None``, so when ``GeologicalModel.from_processor``
+    later calls ``create_and_add_foliation(s, faults=None)``, the resulting
+    stratigraphy feature has zero fault regions. The implicit foliation
+    field is then smooth across faults and the extracted isosurfaces don't
+    show fault offset — even though the faults are interpolated as separate
+    features and exist in the model.
+
+    Default to the standard LoopStructural assumption: every fault cuts every
+    stratigraphic supergroup. If the source data later provides per-unit
+    fault relationships (map2loop's topology_unit_fault.csv has them), this
+    is the entry point to apply that finer mapping.
+    """
+    if processor is None:
+        return
+    if getattr(processor, "fault_stratigraphy", None) is not None:
+        return  # caller already populated; respect it
+    fnet = getattr(processor, "fault_network", None)
+    if fnet is None:
+        return
+    fault_names = list(getattr(fnet, "faults", []) or [])
+    if not fault_names:
+        return
+    sc = getattr(processor, "stratigraphic_column", None) or {}
+    supergroups = [k for k in sc.keys() if k != "faults"]
+    if not supergroups:
+        return
+    # fault_stratigraphy is a property with no setter; write to the backing
+    # field directly. Same field ProcessInputData.__init__ assigns to.
+    processor._fault_stratigraphy = {sg: list(fault_names) for sg in supergroups}
+
+
 def _iter_stratigraphic_surfaces(model):
     """Yield (name, pyvista mesh) for each well-extractable stratigraphic horizon.
 
@@ -573,15 +608,22 @@ def _build_3d(loop_filename: pathlib.Path, out_dir: pathlib.Path, export_formats
         return {}
     pf = ProjectFile(str(loop_filename))
     processor = LoopProjectfileProcessor(pf)
+    # Patch: LoopProjectfileProcessor hardcodes fault_stratigraphy=None, which
+    # means create_and_add_foliation never receives a `faults=` list. The
+    # result: the stratigraphy interpolator has no fault regions, so the
+    # implicit field is smooth across faults and the extracted isosurfaces
+    # are continuous meshes that don't show fault offset. Populate it with
+    # every fault cutting every supergroup so the foliations get fault
+    # regions added and surfaces clip correctly at fault planes.
+    _patch_fault_stratigraphy(processor)
     model = GeologicalModel.from_processor(processor)
     model.update()
-    # Cache the processor on the model so _get_stratigraphic_surfaces can read
-    # the correct per-unit isovalues out of it. LoopStructural's
+    # Cache the processor on the model so _iter_stratigraphic_surfaces can
+    # read the correct per-unit isovalues. LoopStructural 1.6.27's
     # stratigraphic_column.get_isovalues() returns value=inf for every unit
-    # except the first in this version (1.6.27) — that's why the default
-    # model.get_stratigraphic_surfaces() produces only 1/N surfaces and 10x
-    # "Failed to extract isosurface for inf" warnings. We pull the isovalues
-    # straight from the processor's stratigraphic_column instead.
+    # except the first, so the default model.get_stratigraphic_surfaces()
+    # produces only 1/N surfaces. We bypass it by feeding the correct
+    # isovalues from the processor directly into feature.surfaces().
     model._wrapper_processor = processor
     exported = {}
     if "vtk" in export_formats:
